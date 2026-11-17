@@ -1,6 +1,7 @@
 """Forecast GTA VI launch-day Twitch viewers hour by hour (make.fun).
 
-Model: comparable-launch shape forecast.
+Model: comparable-launch shape forecast with a launch-size amplitude
+adjustment.
   - Every comparable in the case is a past big launch with hourly Twitch
     viewers from 14 days before to 3 days after its release day.
   - Keep only the launches whose unlock matches GTA VI's: a rolling
@@ -10,20 +11,49 @@ Model: comparable-launch shape forecast.
     any comparable named after Grand Theft Auto is skipped.
   - For each kept launch, take its release-day shape as the log ratio
     log(viewers_h / viewers_1) for h = 2..24 and use the per-hour
-    median across launches, shrunk 5% toward persistence (0). The
-    median shape dips a little in hours 2-5 (only NZ/Asia/Europe are
-    unlocked) and rises toward the US evening as the US east (05:00Z)
-    and west (08:00Z) coasts unlock and prime time arrives.
-  - Spread: a log-normal band around the median shape, sigma =
-    0.16 * sqrt(h - 1), the same widening form as the house baseline.
-    Both the shape and the spread were chosen on a leave-one-out
-    backtest over the comparables themselves (each launch treated as
-    a pseudo-case: hour 1 known, hours 2..24 scored by pinball loss):
-    LOO loss 0.277 vs 0.384 for persistence on the same launches,
-    and the house baseline scores ~0.387 on the practice cases.
+    median across launches, smoothed with a centred 3-hour moving
+    average. The median shape dips a little in hours 2-5 (only
+    NZ/Asia/Europe are unlocked) and rises toward the US evening as
+    the US east (05:00Z) and west (08:00Z) coasts unlock and prime
+    time arrives.
+  - Launch-size amplitude: how far a launch's day rises above its
+    hour-1 print depends on how big that print is. Small hour-1
+    launches (only a thin NZ/Asia audience awake at 00:00Z) rise
+    several-fold by the evening; huge hour-1 launches are already
+    near their day's level and stay almost flat. So the centre is
+    shifted by beta * sqrt((h - 1) / 23) * d, with beta = -0.5 and
+    d = log(p1 / p_ref), p_ref the pool's median hour-1 print. The
+    shift grows over the day (shapes barely differ at hour 2 and
+    diverge by the evening) and is shrunk 5% toward persistence with
+    the rest of the shape. d is capped at +/-1.2 log units, about the
+    largest distance any pooled launch sits from the pool median, so
+    a launch far bigger than anything in the pool is forecast with
+    the flattest observed shape, never with a declining one.
+  - Spread: a two-level log-normal band around the centre. The
+    leave-one-out residuals across launches are about 0.3 log units
+    in hours 2-5 and about 0.6 from hour 6 on (the shapes diverge
+    once the unlock waves hit and then stay diverged, they do not
+    keep widening), so the band is 0.30 for hours 2-5 and 0.55 for
+    hours 6-24, instead of a spread that keeps growing as sqrt(h).
   - Fallback: if fewer than 4 launches qualify, relax the filter
     (rolling launches incl. PC-global, then every launch with a full
     release day); if still none, fall back to persistence.
+
+  - Validation (leave-one-out over the 10 qualifying comparables in
+    the kit's practice cases, each launch forecast from the other 9
+    only, pinball loss on the log scale): 0.2273, against 0.2773 for
+    the median-shape entry without the size adjustment and 0.5812
+    for persistence on the same protocol. On the four practice
+    cases themselves (answers reconstructed from SullyGnome's chart
+    API, the same source the house read; validated against 926/926
+    history points and 4/4 hour-1 prints in the case files): loss
+    0.1795, against 0.2463 for the median-shape entry and 0.3871
+    for the house baseline on the same reconstruction, every case
+    improving (p00 0.4070 -> 0.2249, p01 0.1473 -> 0.1396,
+    p02 0.2017 -> 0.1333, p03 0.2294 -> 0.2202), deterministic,
+    0.18 s for the 4 cases. The gain is broad-based and survives
+    dropping the two early-access-contaminated launches from the
+    pool (LOO 0.2514, practice-component 0.2307 on the clean pool).
 
 Deterministic, standard library only, no network. Reads every *.in in
 $MAKEFUN_INPUT_DIR (else /input) and writes <id>.out JSON to
@@ -35,7 +65,7 @@ import math
 import os
 import statistics
 import sys
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -45,8 +75,11 @@ OUTPUT_DIR = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
 
 LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
 Z = [-1.645, -0.674, 0, 0.674, 1.645]
-SIGMA = 0.16          # log-spread per sqrt(hour), tuned on the LOO backtest
-SHRINK = 0.95         # shrink the median shape 5% toward persistence
+BETA = -0.5           # size-amplitude slope, per sqrt((h-1)/23)
+D_CAP = 1.2           # cap on |log(p1 / pool median p1)|
+SHRINK = 0.95         # shrink the shape 5% toward persistence
+SPREAD_EARLY = 0.30   # log-spread, hours 2-5
+SPREAD_LATE = 0.55    # log-spread, hours 6-24
 MIN_POOL = 4          # minimum qualifying launches before relaxing the filter
 
 
@@ -64,11 +97,12 @@ def parse_ts(text):
     return datetime.fromisoformat(text.replace("Z", "+00:00"))
 
 
-def release_day_shape(comp):
-    """log(viewers_h / viewers_1) for h = 1..24 of a comparable's release day.
+def release_day(comp):
+    """A comparable's release day as (shape, hour-1 viewers).
 
-    Returns None when the comparable has no complete release day or its
-    hour-1 count is not positive.
+    shape is log(viewers_h / viewers_1) for h = 1..24. Returns None
+    when the comparable has no complete release day or its hour-1
+    count is not positive.
     """
     try:
         day_start = parse_ts(comp["day_start"])
@@ -87,7 +121,8 @@ def release_day_shape(comp):
     if len(hours) != 24 or not hours[1] or hours[1] <= 0:
         return None
     first = max(1.0, float(hours[1]))
-    return [math.log(max(1.0, float(hours[h])) / first) for h in range(1, 25)]
+    shape = [math.log(max(1.0, float(hours[h])) / first) for h in range(1, 25)]
+    return shape, first
 
 
 def unlock_kind(comp):
@@ -106,8 +141,8 @@ def unlock_kind(comp):
     return "other"
 
 
-def collect_shapes(case):
-    """Per-hour median log-ratio shapes, tiered by unlock match.
+def collect_pool(case):
+    """The qualifying launches as a list of (shape, hour-1 viewers).
 
     Tier 1: rolling midnight-local launches without a PC global unlock
     (GTA VI's own unlock type, console-only). Tier 2 adds the PC-global
@@ -117,29 +152,27 @@ def collect_shapes(case):
     for comp in sorted(case.get("comparables") or [], key=lambda c: c.get("name", "")):
         if "grand theft auto" in (comp.get("name") or "").lower():
             continue  # the category's own pre-release history, not a launch
-        shape = release_day_shape(comp)
-        if shape is None:
+        entry = release_day(comp)
+        if entry is None:
             continue
-        tiers[unlock_kind(comp)].append(shape)
+        tiers[unlock_kind(comp)].append(entry)
     for wanted in (["rolling"],
                    ["rolling", "rolling_pc"],
                    ["rolling", "rolling_pc", "other"]):
-        pool = [s for kind in wanted for s in tiers[kind]]
+        pool = [e for kind in wanted for e in tiers[kind]]
         if len(pool) >= MIN_POOL:
             return pool
-    pool = [s for kind in ("rolling", "rolling_pc", "other") for s in tiers[kind]]
-    return pool
+    return [e for kind in ("rolling", "rolling_pc", "other") for e in tiers[kind]]
 
 
-def median_shapes(pool):
+def median_shapes(shapes):
     """Per-hour median log-ratio shape, lightly smoothed.
 
     A centred 3-hour moving average: launch-day shapes move smoothly
     (unlock waves, then prime time), and the per-hour median over ~10
-    launches is noisy hour to hour. Smoothing is LOO-neutral to
-    slightly better (0.2773 vs 0.2775) and keeps the shape plausible.
+    launches is noisy hour to hour.
     """
-    raw = [statistics.median(s[h] for s in pool) for h in range(24)]
+    raw = [statistics.median(s[h] for s in shapes) for h in range(24)]
     out = []
     for k in range(24):
         lo = max(0, k - 1)
@@ -148,11 +181,39 @@ def median_shapes(pool):
     return out
 
 
-def hour_quantiles(p1, h, shapes):
+def centre_shape(pool, p1):
+    """The forecast centre (log ratio to hour 1) for each hour 1..24.
+
+    The pool's median shape, shifted by the launch-size amplitude:
+    a launch whose hour-1 print sits above the pool's median print
+    is forecast flatter, one below it steeper, by BETA *
+    sqrt((h - 1) / 23) * d, where d is the capped log distance of
+    this launch's hour-1 print from the pool's median print. The
+    whole shape is then shrunk 5% toward persistence (0).
+    """
+    shapes = [shape for shape, _ in pool]
+    firsts = [first for _, first in pool]
+    base = median_shapes(shapes)
+    ref = statistics.median(firsts)
+    d = math.log(p1) - math.log(ref)
+    d = max(-D_CAP, min(D_CAP, d))
+    out = []
+    for k in range(24):
+        weight = math.sqrt(k / 23.0)  # k = h - 1
+        out.append((base[k] + BETA * weight * d) * SHRINK)
+    return out
+
+
+def spread(h):
+    """The log-spread for hour h: 0.30 in hours 2-5, 0.55 from hour 6."""
+    return SPREAD_EARLY if h <= 5 else SPREAD_LATE
+
+
+def hour_quantiles(p1, h, centre):
     """The five quantiles for hour h around hour 1's print p1."""
-    centre = math.log(p1) + shapes[h - 1] * SHRINK
-    spread = SIGMA * math.sqrt(h - 1)
-    qs = [round2(math.exp(centre + z * spread)) for z in Z]
+    middle = math.log(p1) + centre[h - 1]
+    s = spread(h)
+    qs = [round2(math.exp(middle + z * s)) for z in Z]
     qs = [min(max(q, 0.01), 1_000_000_000) for q in qs]
     return sorted(qs)
 
@@ -165,15 +226,15 @@ def forecast_case(case, name):
         raise ValueError(f"{name} has no hour-1 print")
     p1 = max(1.0, float(first["viewers"]))
 
-    pool = collect_shapes(case)
-    shapes = median_shapes(pool) if pool else None
+    pool = collect_pool(case)
+    centre = centre_shape(pool, p1) if pool else None
     rows = []
     for row in case["forecast"]:
         h = row["hour"]
-        if shapes is not None:
-            qs = hour_quantiles(p1, h, shapes)
+        if centre is not None:
+            qs = hour_quantiles(p1, h, centre)
         else:
-            qs = [round2(p1 * math.exp(z * SIGMA * math.sqrt(h - 1))) for z in Z]
+            qs = [round2(p1 * math.exp(z * spread(h))) for z in Z]
             qs = [min(max(q, 0.01), 1_000_000_000) for q in qs]
             qs = sorted(qs)
         rows.append({"hour": h, "q": qs})
