@@ -1,7 +1,7 @@
 """Forecast GTA VI launch-day Twitch viewers hour by hour (make.fun).
 
 Model: comparable-launch shape forecast with a launch-size amplitude
-adjustment, recalibrated in improve2.
+adjustment, recalibrated in improve3 on top of the improve2 entry.
   - Every comparable in the case is a past big launch with hourly Twitch
     viewers from 14 days before to 3 days after its release day.
   - Keep only the launches whose unlock matches GTA VI's: a rolling
@@ -29,45 +29,55 @@ adjustment, recalibrated in improve2.
     largest distance any pooled launch sits from the pool median, so
     a launch far bigger than anything in the pool is forecast with
     the flattest observed shape, never with a declining one.
-  - Spread: a two-level log-normal band around the centre, calibrated
-    on the leave-one-out residuals of this model: their standard
-    deviation is about 0.27 log units in hours 2-5 and about 0.50
-    from hour 6 on (the shapes diverge once the unlock waves hit and
-    then stay diverged, they do not keep widening), so the band is
-    0.25 for hours 2-5 and 0.50 for hours 6-24, instead of a spread
-    that keeps growing as sqrt(h). A finer grid over beta (-0.55 to
-    -0.65) and the two spread levels (0.22-0.28 / 0.45-0.53) is a flat
-    plateau, so the chosen point is not a sharp optimum.
+  - Morning-dip correction (new in improve3): the leave-one-out
+    residuals of the improve2 centre are systematically negative in
+    hours 3 and 4 (mean -0.15 and -0.17 log units; 9 of 10 launches
+    sit below the centre at hour 4). The pool's median shape
+    overstates the early-morning level: the overnight audience falls
+    further after the midnight unlock wave than the median launch
+    suggests, before the US unlocks lift it again. So the centre is
+    lowered by 0.10 log units at hours 3 and 4 only. The correction
+    is a flat plateau (depths 0.08-0.15 score within 0.0002 of each
+    other on the leave-one-out protocol), so 0.10 is a central,
+    untuned choice, not a sharp optimum.
+  - Skewed late spread (new in improve3): from hour 6 on, the
+    leave-one-out residuals are right-skewed (their mean sits above
+    their median in the afternoon hours), so a symmetric band wastes
+    width below the centre and starves the upper tail. The band is
+    therefore asymmetric late: the lower quantiles use a log-spread
+    of 0.40 and the upper quantiles 0.55, around the same centre.
+    Hours 2-5 keep a symmetric 0.25 spread (their residual
+    standard deviation is about 0.27). The two changes together are
+    broad-based: 6 of the 10 leave-one-out launches and 3 of the 4
+    practice cases improve, and they still win on a clean pool with
+    the two early-access-contaminated launches removed.
   - Fallback: if fewer than 4 launches qualify, relax the filter
     (rolling launches incl. PC-global, then every launch with a full
     release day); if still none, fall back to persistence.
 
   - Validation (leave-one-out over the 10 qualifying comparables in
     the kit's practice cases, each launch forecast from the other 9
-    only, pinball loss on the log scale): 0.2245, against 0.2273 for
-    the improve1 entry (beta -0.5, spread 0.30/0.55) and 0.5812 for
-    persistence on the same protocol. On the four practice cases
-    themselves (answers reconstructed from SullyGnome's chart API,
-    the same source the house read; validated against 926/926
-    history points and 4/4 hour-1 prints in the case files): loss
-    0.1686, against 0.1795 for improve1 and 0.3871 for the house
-    baseline on the same reconstruction, three of four practice cases
-    improving (p00 0.2249 -> 0.1966, p01 0.1396 -> 0.1314,
-    p02 0.1333 -> 0.1247; p03 essentially flat, 0.2202 -> 0.2218),
-    typical miss 26.9%, 90% coverage 0.957, deterministic,
-    0.21 s for the 4 cases.
-  - Rejected in improve2: a skewed late spread (wider upper tail,
-    0.45/0.55) — its LOO gain came almost entirely from one outlier
-    launch (Resident Evil Requiem) while 6 of 10 LOO cases got worse;
-    per-hour residual-sd spreads; empirical residual quantiles (one
-    outlier inflates everyone's upper quantile); spread inflation
-    with |d|; a second feature term on pre-release ratios or
-    viewers-per-channel; per-hour centre bias shifts; raising the d
-    cap to 1.5-2.0 (practice improves, LOO worsens — the cap stays
-    1.2). A clean-pool stress test (dropping the two
-    early-access-contaminated launches) favours the old parameters,
-    so the gain is tied to the full tier-1 pool the entry actually
-    uses; the improvement is modest and both scores move together.
+    only, pinball loss on the log scale): 0.2218, against 0.2245
+    for the improve2 entry and 0.5812 for persistence on the same
+    protocol; per-case: RE Requiem 0.5535, Hogwarts 0.1542, Yotei
+    0.1946, MH Wilds 0.2610, BO6 0.1358, MWIII 0.1650, MW4 0.1767,
+    Zelda 0.1356, FFVII Rebirth 0.3203, TLOU2 0.1211 (6 of 10 better
+    than improve2). On the four practice cases themselves (answers
+    reconstructed from SullyGnome's chart API, the same source the
+    house read; validated against 926/926 history points and 4/4
+    hour-1 prints in the case files): loss 0.1632, against 0.1686
+    for improve2 and 0.3871 for the house baseline on the same
+    reconstruction (p00 0.1855, p01 0.1269, p02 0.1186, p03 0.2219),
+    typical miss 26.3%, 90% coverage 0.946, deterministic, 0.37 s
+    for the 4 cases.
+  - Rejected in improve3: raising the d cap to 1.5-2.0 (practice
+    improves a lot, leave-one-out worsens — the cap stays 1.2);
+    steepening beta to -0.65 or beyond with the dip (practice
+    improves, leave-one-out worsens); a wide dip over hours 2-5
+    (worse than the hours 3-4 step on both protocols); a late
+    centre shift (residual means there are outlier-driven, medians
+    near zero); narrowing the late spread below 0.40/0.50
+    (practice improves, leave-one-out worsens).
 
 Deterministic, standard library only, no network. Reads every *.in in
 $MAKEFUN_INPUT_DIR (else /input) and writes <id>.out JSON to
@@ -92,8 +102,11 @@ Z = [-1.645, -0.674, 0, 0.674, 1.645]
 BETA = -0.6           # size-amplitude slope, per sqrt((h-1)/23)
 D_CAP = 1.2           # cap on |log(p1 / pool median p1)|
 SHRINK = 0.95         # shrink the shape 5% toward persistence
+DIP_DEPTH = 0.10      # morning-dip correction, log units, hours 3-4
+DIP_HOURS = (3, 4)    # hours the dip correction applies to
 SPREAD_EARLY = 0.25   # log-spread, hours 2-5 (LOO residual sd ~0.27)
-SPREAD_LATE = 0.50    # log-spread, hours 6-24 (LOO residual sd ~0.50)
+SPREAD_LO_LATE = 0.40  # log-spread below the centre, hours 6-24
+SPREAD_HI_LATE = 0.55  # log-spread above the centre, hours 6-24
 MIN_POOL = 4          # minimum qualifying launches before relaxing the filter
 
 
@@ -194,7 +207,6 @@ def median_shapes(shapes):
         out.append(statistics.mean(raw[lo:hi]))
     return out
 
-
 def centre_shape(pool, p1):
     """The forecast centre (log ratio to hour 1) for each hour 1..24.
 
@@ -203,7 +215,10 @@ def centre_shape(pool, p1):
     is forecast flatter, one below it steeper, by BETA *
     sqrt((h - 1) / 23) * d, where d is the capped log distance of
     this launch's hour-1 print from the pool's median print. The
-    whole shape is then shrunk 5% toward persistence (0).
+    whole shape is then shrunk 5% toward persistence (0). Finally
+    the morning-dip correction lowers hours 3 and 4 by DIP_DEPTH:
+    held-out launches sit systematically below the uncorrected
+    centre in those two hours, and nowhere else as consistently.
     """
     shapes = [shape for shape, _ in pool]
     firsts = [first for _, first in pool]
@@ -213,21 +228,48 @@ def centre_shape(pool, p1):
     d = max(-D_CAP, min(D_CAP, d))
     out = []
     for k in range(24):
+        h = k + 1
         weight = math.sqrt(k / 23.0)  # k = h - 1
-        out.append((base[k] + BETA * weight * d) * SHRINK)
+        value = (base[k] + BETA * weight * d) * SHRINK
+        if h in DIP_HOURS:
+            value -= DIP_DEPTH
+        out.append(value)
     return out
 
 
-def spread(h):
-    """The log-spread for hour h: 0.25 in hours 2-5, 0.50 from hour 6."""
-    return SPREAD_EARLY if h <= 5 else SPREAD_LATE
+def spreads(h):
+    """The (lower, upper) log-spreads for hour h.
+
+    Hours 2-5: a symmetric 0.25 band. From hour 6 the band is
+    skewed: 0.40 below the centre, 0.55 above it, because the
+    leave-one-out residuals are right-skewed once the unlock waves
+    have hit — the day's upside is wider than its downside.
+    """
+    if h <= 5:
+        return SPREAD_EARLY, SPREAD_EARLY
+    return SPREAD_LO_LATE, SPREAD_HI_LATE
 
 
 def hour_quantiles(p1, h, centre):
     """The five quantiles for hour h around hour 1's print p1."""
     middle = math.log(p1) + centre[h - 1]
-    s = spread(h)
-    qs = [round2(math.exp(middle + z * s)) for z in Z]
+    s_lo, s_hi = spreads(h)
+    qs = []
+    for z in Z:
+        s = s_lo if z < 0 else s_hi
+        qs.append(round2(math.exp(middle + z * s)))
+    qs = [min(max(q, 0.01), 1_000_000_000) for q in qs]
+    return sorted(qs)
+
+
+def fallback_quantiles(p1, h):
+    """Persistence quantiles (no qualifying pool): hour 1's print
+    with the same two-sided spread the model would use."""
+    s_lo, s_hi = spreads(h)
+    qs = []
+    for z in Z:
+        s = s_lo if z < 0 else s_hi
+        qs.append(round2(p1 * math.exp(z * s)))
     qs = [min(max(q, 0.01), 1_000_000_000) for q in qs]
     return sorted(qs)
 
@@ -248,9 +290,7 @@ def forecast_case(case, name):
         if centre is not None:
             qs = hour_quantiles(p1, h, centre)
         else:
-            qs = [round2(p1 * math.exp(z * spread(h))) for z in Z]
-            qs = [min(max(q, 0.01), 1_000_000_000) for q in qs]
-            qs = sorted(qs)
+            qs = fallback_quantiles(p1, h)
         rows.append({"hour": h, "q": qs})
     return {"hours": rows}
 
