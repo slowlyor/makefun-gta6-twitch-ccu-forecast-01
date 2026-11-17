@@ -1,7 +1,7 @@
 """Forecast GTA VI launch-day Twitch viewers hour by hour (make.fun).
 
 Model: comparable-launch shape forecast with a launch-size amplitude
-adjustment.
+adjustment, recalibrated in improve2.
   - Every comparable in the case is a past big launch with hourly Twitch
     viewers from 14 days before to 3 days after its release day.
   - Keep only the launches whose unlock matches GTA VI's: a rolling
@@ -21,7 +21,7 @@ adjustment.
     launches (only a thin NZ/Asia audience awake at 00:00Z) rise
     several-fold by the evening; huge hour-1 launches are already
     near their day's level and stay almost flat. So the centre is
-    shifted by beta * sqrt((h - 1) / 23) * d, with beta = -0.5 and
+    shifted by beta * sqrt((h - 1) / 23) * d, with beta = -0.6 and
     d = log(p1 / p_ref), p_ref the pool's median hour-1 print. The
     shift grows over the day (shapes barely differ at hour 2 and
     diverge by the evening) and is shrunk 5% toward persistence with
@@ -29,31 +29,45 @@ adjustment.
     largest distance any pooled launch sits from the pool median, so
     a launch far bigger than anything in the pool is forecast with
     the flattest observed shape, never with a declining one.
-  - Spread: a two-level log-normal band around the centre. The
-    leave-one-out residuals across launches are about 0.3 log units
-    in hours 2-5 and about 0.6 from hour 6 on (the shapes diverge
-    once the unlock waves hit and then stay diverged, they do not
-    keep widening), so the band is 0.30 for hours 2-5 and 0.55 for
-    hours 6-24, instead of a spread that keeps growing as sqrt(h).
+  - Spread: a two-level log-normal band around the centre, calibrated
+    on the leave-one-out residuals of this model: their standard
+    deviation is about 0.27 log units in hours 2-5 and about 0.50
+    from hour 6 on (the shapes diverge once the unlock waves hit and
+    then stay diverged, they do not keep widening), so the band is
+    0.25 for hours 2-5 and 0.50 for hours 6-24, instead of a spread
+    that keeps growing as sqrt(h). A finer grid over beta (-0.55 to
+    -0.65) and the two spread levels (0.22-0.28 / 0.45-0.53) is a flat
+    plateau, so the chosen point is not a sharp optimum.
   - Fallback: if fewer than 4 launches qualify, relax the filter
     (rolling launches incl. PC-global, then every launch with a full
     release day); if still none, fall back to persistence.
 
   - Validation (leave-one-out over the 10 qualifying comparables in
     the kit's practice cases, each launch forecast from the other 9
-    only, pinball loss on the log scale): 0.2273, against 0.2773 for
-    the median-shape entry without the size adjustment and 0.5812
-    for persistence on the same protocol. On the four practice
-    cases themselves (answers reconstructed from SullyGnome's chart
-    API, the same source the house read; validated against 926/926
+    only, pinball loss on the log scale): 0.2245, against 0.2273 for
+    the improve1 entry (beta -0.5, spread 0.30/0.55) and 0.5812 for
+    persistence on the same protocol. On the four practice cases
+    themselves (answers reconstructed from SullyGnome's chart API,
+    the same source the house read; validated against 926/926
     history points and 4/4 hour-1 prints in the case files): loss
-    0.1795, against 0.2463 for the median-shape entry and 0.3871
-    for the house baseline on the same reconstruction, every case
-    improving (p00 0.4070 -> 0.2249, p01 0.1473 -> 0.1396,
-    p02 0.2017 -> 0.1333, p03 0.2294 -> 0.2202), deterministic,
-    0.18 s for the 4 cases. The gain is broad-based and survives
-    dropping the two early-access-contaminated launches from the
-    pool (LOO 0.2514, practice-component 0.2307 on the clean pool).
+    0.1686, against 0.1795 for improve1 and 0.3871 for the house
+    baseline on the same reconstruction, three of four practice cases
+    improving (p00 0.2249 -> 0.1966, p01 0.1396 -> 0.1314,
+    p02 0.1333 -> 0.1247; p03 essentially flat, 0.2202 -> 0.2218),
+    typical miss 26.9%, 90% coverage 0.957, deterministic,
+    0.21 s for the 4 cases.
+  - Rejected in improve2: a skewed late spread (wider upper tail,
+    0.45/0.55) — its LOO gain came almost entirely from one outlier
+    launch (Resident Evil Requiem) while 6 of 10 LOO cases got worse;
+    per-hour residual-sd spreads; empirical residual quantiles (one
+    outlier inflates everyone's upper quantile); spread inflation
+    with |d|; a second feature term on pre-release ratios or
+    viewers-per-channel; per-hour centre bias shifts; raising the d
+    cap to 1.5-2.0 (practice improves, LOO worsens — the cap stays
+    1.2). A clean-pool stress test (dropping the two
+    early-access-contaminated launches) favours the old parameters,
+    so the gain is tied to the full tier-1 pool the entry actually
+    uses; the improvement is modest and both scores move together.
 
 Deterministic, standard library only, no network. Reads every *.in in
 $MAKEFUN_INPUT_DIR (else /input) and writes <id>.out JSON to
@@ -75,11 +89,11 @@ OUTPUT_DIR = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
 
 LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
 Z = [-1.645, -0.674, 0, 0.674, 1.645]
-BETA = -0.5           # size-amplitude slope, per sqrt((h-1)/23)
+BETA = -0.6           # size-amplitude slope, per sqrt((h-1)/23)
 D_CAP = 1.2           # cap on |log(p1 / pool median p1)|
 SHRINK = 0.95         # shrink the shape 5% toward persistence
-SPREAD_EARLY = 0.30   # log-spread, hours 2-5
-SPREAD_LATE = 0.55    # log-spread, hours 6-24
+SPREAD_EARLY = 0.25   # log-spread, hours 2-5 (LOO residual sd ~0.27)
+SPREAD_LATE = 0.50    # log-spread, hours 6-24 (LOO residual sd ~0.50)
 MIN_POOL = 4          # minimum qualifying launches before relaxing the filter
 
 
@@ -205,7 +219,7 @@ def centre_shape(pool, p1):
 
 
 def spread(h):
-    """The log-spread for hour h: 0.30 in hours 2-5, 0.55 from hour 6."""
+    """The log-spread for hour h: 0.25 in hours 2-5, 0.50 from hour 6."""
     return SPREAD_EARLY if h <= 5 else SPREAD_LATE
 
 
